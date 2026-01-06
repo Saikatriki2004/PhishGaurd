@@ -59,22 +59,17 @@ Track and review all your previous scans with detailed logs.
    cd PhishGaurd
    ```
 
-2. **Navigate to the application directory**
-   ```bash
-   cd "Phishing Web Sites Detection Using Machine Learning"
-   ```
-
-3. **Install dependencies**
+2. **Install dependencies**
    ```bash
    pip install -r requirements.txt
    ```
 
-4. **Run the application**
+3. **Run the application**
    ```bash
    python app.py
    ```
 
-5. **Open in browser**
+4. **Open in browser**
    ```
    http://127.0.0.1:5000
    ```
@@ -85,36 +80,37 @@ Track and review all your previous scans with detailed logs.
 
 ```
 PhishGaurd/
-├── Phishing Web Sites Detection Using Machine Learning/
-│   ├── app.py                    # Main Flask application
-│   ├── decision_pipeline.py      # Core ML decision pipeline
-│   ├── feature_extractor.py      # URL feature extraction
-│   ├── trusted_domains.py        # Trusted domain whitelist
-│   │
-│   ├── models/
-│   │   ├── model.pkl             # Trained ML model
-│   │   └── model_metadata.json   # Model performance metrics
-│   │
-│   ├── src/
-│   │   ├── features/             # Feature extraction modules
-│   │   ├── pipeline/             # ML pipeline components
-│   │   ├── training/             # Model training scripts
-│   │   ├── monitoring/           # Model monitoring
-│   │   ├── governance/           # AI governance & safety
-│   │   └── observability/        # Metrics & logging
-│   │
-│   ├── templates/
-│   │   ├── index.html            # Main scanner page
-│   │   ├── scan_dashboard.html   # Scan dashboard
-│   │   ├── scan_history.html     # Scan history viewer
-│   │   ├── threat_map.html       # Global threat map
-│   │   └── settings.html         # Application settings
-│   │
-│   ├── static/                   # CSS, JS, images
-│   ├── datasets/                 # Training datasets
-│   ├── tests/                    # Unit tests
-│   ├── config/                   # Configuration files
-│   └── requirements.txt          # Python dependencies
+├── app.py                        # Main Flask application
+├── decision_pipeline.py          # Core ML decision pipeline
+├── feature_extractor.py          # URL feature extraction
+├── trusted_domains.py            # Trusted domain whitelist
+├── requirements.txt              # Python dependencies
+├── Procfile                      # Deployment configuration
+│
+├── models/
+│   ├── model.pkl                 # Trained ML model
+│   └── model_metadata.json       # Model performance metrics
+│
+├── src/
+│   ├── features/                 # Feature extraction modules
+│   ├── pipeline/                 # ML pipeline components
+│   ├── training/                 # Model training scripts
+│   ├── monitoring/               # Model monitoring
+│   ├── governance/               # AI governance & safety
+│   └── observability/            # Metrics & logging
+│
+├── templates/
+│   ├── index.html                # Main scanner page
+│   ├── scan_dashboard.html       # Scan dashboard
+│   ├── scan_history.html         # Scan history viewer
+│   ├── threat_map.html           # Global threat map
+│   └── settings.html             # Application settings
+│
+├── static/                       # CSS, JS, images
+├── datasets/                     # Training datasets
+├── tests/                        # Unit tests
+├── config/                       # Configuration files
+└── audit/                        # Policy audit logs
 ```
 
 ---
@@ -249,7 +245,6 @@ GET /metrics
 ## 🧪 Running Tests
 
 ```bash
-cd "Phishing Web Sites Detection Using Machine Learning"
 python -m pytest tests/ -v
 ```
 
