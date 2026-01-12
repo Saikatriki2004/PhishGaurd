@@ -173,6 +173,64 @@ class SafetyBudgetStatus:
 
 
 # ============================================================================
+# FILE LOCKING UTILITIES
+# ============================================================================
+
+FILE_LOCK_TIMEOUT = 5.0
+FILE_LOCK_MAX_RETRIES = 50
+FILE_LOCK_RETRY_INTERVAL = 0.1
+STATE_CACHE_TTL_SECONDS = 5.0  # Re-read from disk every 5s max
+
+import time
+import sys
+
+def _acquire_lock(fh, exclusive: bool, timeout: float = FILE_LOCK_TIMEOUT) -> bool:
+    """
+    Acquire file lock with timeout and max retries.
+    
+    Args:
+        fh: File handle
+        exclusive: True for LOCK_EX (write), False for LOCK_SH (read)
+        timeout: Max seconds to wait
+    
+    Returns:
+        True if lock acquired, False if timeout/max retries exceeded
+    """
+    start = time.time()
+    retries = 0
+    
+    while time.time() - start < timeout and retries < FILE_LOCK_MAX_RETRIES:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                # Windows: locking is always exclusive, but we use non-blocking
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                fcntl.flock(fh, lock_type | fcntl.LOCK_NB)
+            return True
+        except (IOError, OSError):
+            retries += 1
+            time.sleep(FILE_LOCK_RETRY_INTERVAL)
+    
+    return False
+
+
+def _release_lock(fh) -> None:
+    """Release file lock."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    except Exception:
+        pass  # Best effort
+
+
+# ============================================================================
 # GOVERNANCE ENGINE
 # ============================================================================
 
@@ -185,51 +243,300 @@ class GovernanceEngine:
     - Every exception is logged
     - Prefer rejection over risk
     - Fail fast on violations
+    
+    PERFORMANCE:
+    - Read-through cache with TTL (no lock on every read)
+    - Shared locks for reads, exclusive for writes
+    - Lock timeout with max retries to prevent hangs
     """
     
     STATE_FILE = "governance_state.json"
     
     def __init__(self, state_dir: str = "."):
         """
-        Initialize governance engine.
+        Initialize governance engine with caching.
         
         Args:
             state_dir: Directory for state files
         """
         self.state_dir = state_dir
         self.state_path = os.path.join(state_dir, self.STATE_FILE)
+        
+        # In-memory cache for read performance
+        self._cached_state: Optional[Dict[str, Any]] = None
+        self._cache_timestamp: float = 0.0
+        
+        self._load_state_cached()
+        logger.info("[GOVERNANCE] Engine initialized with caching")
+    
+    def _is_cache_valid(self) -> bool:
+        """Check if cached state is still fresh."""
+        if self._cached_state is None:
+            return False
+        return (time.time() - self._cache_timestamp) < STATE_CACHE_TTL_SECONDS
+    
+    def _load_state_cached(self) -> None:
+        """Load state using read-through cache (no lock if cache valid)."""
+        if self._is_cache_valid():
+            return  # Use cached state - no disk I/O
+        
         self._load_state()
-        logger.info("[GOVERNANCE] Engine initialized")
     
     def _load_state(self) -> None:
-        """Load governance state from disk."""
-        if os.path.exists(self.state_path):
-            with open(self.state_path, 'r') as f:
-                data = json.load(f)
-            self.overrides = [Override(**o) for o in data.get("overrides", [])]
-            self.canary_signals = {
-                k: CanarySignal(**v) for k, v in data.get("canary_signals", {}).items()
-            }
-            budget_data = data.get("safety_budget")
-            if budget_data:
-                self.safety_budget = SafetyBudgetStatus(**budget_data)
-            else:
-                self._reset_safety_budget()
-        else:
+        """Load governance state from disk with shared lock."""
+        if not os.path.exists(self.state_path):
             self.overrides = []
             self.canary_signals = {}
             self._reset_safety_budget()
+            self._cached_state = {}
+            self._cache_timestamp = time.time()
+            return
+        
+        try:
+            with open(self.state_path, 'r') as f:
+                # Shared lock for reads - allows concurrent readers
+                if not _acquire_lock(f, exclusive=False, timeout=2.0):
+                    logger.warning("[GOVERNANCE] Read lock timeout, using stale cache")
+                    return
+                
+                try:
+                    data = json.load(f)
+                finally:
+                    _release_lock(f)
+            
+            self._parse_state_data(data)
+            self._cached_state = data
+            self._cache_timestamp = time.time()
+            
+        except (PermissionError, IOError) as e:
+            logger.error(f"[GOVERNANCE] Cannot read state file: {e}")
+            if self._cached_state is None:
+                self._reset_safety_budget()
+                self.safety_budget.is_frozen = True
+                self.safety_budget.freeze_reason = f"State unreadable: {e}"
+        except json.JSONDecodeError as e:
+            logger.error(f"[GOVERNANCE] Invalid state JSON: {e}")
+            self._reset_safety_budget()
     
-    def _save_state(self) -> None:
-        """Persist governance state to disk."""
-        data = {
+    def _parse_state_data(self, data: Dict[str, Any]) -> None:
+        """Parse loaded JSON into state objects."""
+        self.overrides = [Override(**o) for o in data.get("overrides", [])]
+        self.canary_signals = {
+            k: CanarySignal(**v) for k, v in data.get("canary_signals", {}).items()
+        }
+        budget_data = data.get("safety_budget")
+        if budget_data:
+            self.safety_budget = SafetyBudgetStatus(**budget_data)
+        else:
+            self._reset_safety_budget()
+    
+    def _state_to_dict(self) -> Dict[str, Any]:
+        """Convert current state to serializable dict."""
+        return {
             "overrides": [o.to_dict() for o in self.overrides],
             "canary_signals": {k: asdict(v) for k, v in self.canary_signals.items()},
             "safety_budget": asdict(self.safety_budget),
             "last_updated": datetime.now(timezone.utc).isoformat()
         }
-        with open(self.state_path, 'w') as f:
-            json.dump(data, f, indent=2)
+    
+    # =========================================================================
+    # TRANSACTIONAL STATE UPDATES (Atomic Read-Modify-Write)
+    # =========================================================================
+    
+    def update_state(self, mutator_func) -> bool:
+        """
+        Atomically update governance state with transactional file locking.
+        
+        This method implements the "Read-Modify-Write" pattern with an
+        exclusive lock held throughout the entire operation to prevent
+        Lost Update vulnerabilities in multi-worker environments.
+        
+        Args:
+            mutator_func: A function that takes the current state dict and
+                          returns the modified state dict.
+                          Signature: (Dict[str, Any]) -> Dict[str, Any]
+        
+        Returns:
+            True if update succeeded, False on failure
+            
+        Example:
+            def increment_override_count(state):
+                state["safety_budget"]["overrides_used"] += 1
+                return state
+            
+            engine.update_state(increment_override_count)
+        """
+        # Ensure file exists with valid initial state
+        if not os.path.exists(self.state_path):
+            initial_state = self._state_to_dict()
+            try:
+                with open(self.state_path, 'w') as f:
+                    json.dump(initial_state, f, indent=2)
+                logger.info("[GOVERNANCE] Created initial state file")
+            except IOError as e:
+                logger.critical(f"[GOVERNANCE] Cannot create state file: {e}")
+                return False
+        
+        try:
+            # Open in r+ mode to hold lock for entire read-modify-write cycle
+            with open(self.state_path, 'r+') as f:
+                # Step 1: Acquire EXCLUSIVE lock - CRITICAL CHECK
+                lock_acquired = _acquire_lock(f, exclusive=True)
+                if not lock_acquired:
+                    logger.error(
+                        "[GOVERNANCE] LOCK TIMEOUT - Failed to acquire exclusive lock. "
+                        "Update ABORTED to prevent data corruption."
+                    )
+                    return False
+                
+                try:
+                    # Step 2: READ fresh state from disk (bypass cache)
+                    f.seek(0)
+                    try:
+                        current_state = json.load(f)
+                    except json.JSONDecodeError:
+                        logger.error("[GOVERNANCE] Corrupted state file, using empty state")
+                        current_state = {}
+                    
+                    # Step 3: APPLY mutator function
+                    modified_state = mutator_func(current_state)
+                    modified_state["last_updated"] = datetime.now(timezone.utc).isoformat()
+                    
+                    # Step 4: WRITE modified state back to disk (atomic)
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(modified_state, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())  # Force write to disk
+                    
+                finally:
+                    # Step 5: RELEASE lock (always, even on error)
+                    _release_lock(f)
+                
+                # Step 6: Update local cache with new state
+                self._cached_state = modified_state
+                self._cache_timestamp = time.time()
+                self._parse_state_data(modified_state)
+                
+                return True
+        
+        except FileNotFoundError as e:
+            # Critical: File was deleted between existence check and open
+            logger.critical(
+                f"[GOVERNANCE] STATE FILE MISSING - Critical failure. "
+                f"File was expected at {self.state_path}. Error: {e}"
+            )
+            return False
+                
+        except PermissionError as e:
+            logger.critical(f"[GOVERNANCE] Permission denied: {e}")
+            return False
+        except IOError as e:
+            logger.critical(f"[GOVERNANCE] I/O error during update: {e}")
+            return False
+    
+    # =========================================================================
+    # ATOMIC CONVENIENCE METHODS
+    # =========================================================================
+    
+    def consume_budget(self, budget_key: str = "overrides_used", amount: int = 1) -> bool:
+        """
+        Atomically consume from a safety budget counter.
+        
+        Args:
+            budget_key: The budget counter to decrement (default: "overrides_used")
+            amount: Amount to consume (default: 1)
+        
+        Returns:
+            True if successful, False on failure
+        """
+        def _consume(state: Dict[str, Any]) -> Dict[str, Any]:
+            if "safety_budget" not in state:
+                state["safety_budget"] = asdict(SafetyBudgetStatus(
+                    window_start=datetime.now(timezone.utc).isoformat()
+                ))
+            state["safety_budget"][budget_key] = state["safety_budget"].get(budget_key, 0) + amount
+            return state
+        
+        success = self.update_state(_consume)
+        if success:
+            logger.warning(f"[GOVERNANCE] Budget consumed: {budget_key} += {amount}")
+        return success
+    
+    def add_override(self, override: Override) -> bool:
+        """
+        Atomically add a policy override to the state.
+        
+        Args:
+            override: The Override object to add
+        
+        Returns:
+            True if successful, False on failure
+        """
+        def _add(state: Dict[str, Any]) -> Dict[str, Any]:
+            if "overrides" not in state:
+                state["overrides"] = []
+            state["overrides"].append(override.to_dict())
+            
+            # Also increment override counter
+            if "safety_budget" not in state:
+                state["safety_budget"] = asdict(SafetyBudgetStatus(
+                    window_start=datetime.now(timezone.utc).isoformat()
+                ))
+            state["safety_budget"]["overrides_used"] = state["safety_budget"].get("overrides_used", 0) + 1
+            
+            return state
+        
+        success = self.update_state(_add)
+        if success:
+            logger.warning(f"[GOVERNANCE] Override added: {override.override_id}")
+        return success
+    
+    def trigger_freeze_atomic(self, reason: str) -> bool:
+        """
+        Atomically trigger a safety freeze.
+        
+        Args:
+            reason: Reason for the freeze
+        
+        Returns:
+            True if successful, False on failure
+        """
+        def _freeze(state: Dict[str, Any]) -> Dict[str, Any]:
+            if "safety_budget" not in state:
+                state["safety_budget"] = asdict(SafetyBudgetStatus(
+                    window_start=datetime.now(timezone.utc).isoformat()
+                ))
+            state["safety_budget"]["is_frozen"] = True
+            state["safety_budget"]["freeze_reason"] = reason
+            return state
+        
+        success = self.update_state(_freeze)
+        if success:
+            logger.critical(f"[GOVERNANCE] SAFETY FREEZE: {reason}")
+            self._emit_freeze_warning(reason)
+        return success
+    
+    def _emit_freeze_warning(self, reason: str) -> None:
+        """Emit visible warning about freeze."""
+        import sys
+        lines = [
+            "",
+            "!" * 70,
+            "🚨  SAFETY FREEZE TRIGGERED",
+            "!" * 70,
+            f"Reason: {reason}",
+            f"Time:   {datetime.now(timezone.utc).isoformat()}",
+            "",
+            "ACTIONS REQUIRED:",
+            "1. Investigate the safety violation",
+            "2. Fix root cause",
+            "3. Manually lift freeze via governance API",
+            "!" * 70,
+            ""
+        ]
+        for line in lines:
+            print(line, file=sys.stderr)
     
     def _reset_safety_budget(self) -> None:
         """Reset safety budget for new window."""
@@ -295,10 +602,12 @@ class GovernanceEngine:
             is_active=True
         )
         
-        # Record and save
+        # Record atomically (prevents lost updates)
+        if not self.add_override(override):
+            raise ValueError("Failed to persist override - state update failed")
+        
+        # Update local state for immediate use
         self.overrides.append(override)
-        self.safety_budget.overrides_used += 1
-        self._save_state()
         
         # Emit warning
         self._emit_override_warning(override)
@@ -392,21 +701,30 @@ class GovernanceEngine:
             if override.is_active and not override.is_expired():
                 active.append(override)
             elif override.is_active and override.is_expired():
-                # Mark as inactive
+                # Mark as inactive atomically
                 override.is_active = False
                 logger.info(f"[GOVERNANCE] Override expired: {override.override_id}")
-        self._save_state()
+                self.update_state(lambda s: self._state_to_dict())  # Sync state
         return active
     
     def revoke_override(self, override_id: str, revoked_by: str, reason: str) -> None:
-        """Revoke an active override."""
+        """Revoke an active override atomically."""
+        def _revoke(state: Dict[str, Any]) -> Dict[str, Any]:
+            for override in state.get("overrides", []):
+                if override.get("override_id") == override_id:
+                    override["is_active"] = False
+            return state
+        
+        if not self.update_state(_revoke):
+            raise ValueError(f"Failed to revoke override: {override_id}")
+        
+        # Update local state
         for override in self.overrides:
             if override.override_id == override_id:
                 override.is_active = False
                 logger.warning(
                     f"[GOVERNANCE] Override revoked: {override_id} by {revoked_by}: {reason}"
                 )
-                self._save_state()
                 return
         raise ValueError(f"Override not found: {override_id}")
     
@@ -440,16 +758,16 @@ class GovernanceEngine:
         if verdict == "PHISHING":
             signal.failures += 1
             signal.consecutive_passes = 0  # Reset consecutive count
-            self.safety_budget.canary_failures += 1
+            self.consume_budget("canary_failures", 1)  # Atomic update
             
             # Check if budget exceeded
             if self.safety_budget.is_budget_exceeded().get("canary_failures"):
-                self._trigger_freeze("Canary failure budget exceeded")
+                self.trigger_freeze_atomic("Canary failure budget exceeded")
         else:
             signal.passes += 1
             signal.consecutive_passes += 1
         
-        self._save_state()
+        self.update_state(lambda s: self._state_to_dict())  # Sync canary signals
         return signal
     
     def check_promotion_eligibility(self, domain: str) -> Dict[str, Any]:
@@ -626,9 +944,9 @@ class GovernanceEngine:
         exceeded = self.safety_budget.is_budget_exceeded()
         for budget_type, is_exceeded in exceeded.items():
             if is_exceeded and not self.safety_budget.is_frozen:
-                self._trigger_freeze(f"Safety budget exceeded: {budget_type}")
+                self.trigger_freeze_atomic(f"Safety budget exceeded: {budget_type}")
         
-        self._save_state()
+        self.update_state(lambda s: self._state_to_dict())  # Sync state
     
     def _trigger_freeze(self, reason: str) -> None:
         """
@@ -662,7 +980,7 @@ class GovernanceEngine:
             print(line, file=sys.stderr)
             logger.critical(line)
         
-        self._save_state()
+        self.trigger_freeze_atomic(reason)  # Use atomic freeze
     
     def lift_freeze(self, lifted_by: str, resolution: str, review_ticket: str) -> None:
         """
@@ -680,7 +998,14 @@ class GovernanceEngine:
         self.safety_budget.is_frozen = False
         self.safety_budget.freeze_reason = None
         self._reset_safety_budget()
-        self._save_state()
+        
+        # Atomically update state
+        def _lift(state: Dict[str, Any]) -> Dict[str, Any]:
+            if "safety_budget" in state:
+                state["safety_budget"]["is_frozen"] = False
+                state["safety_budget"]["freeze_reason"] = None
+            return state
+        self.update_state(_lift)
     
     def get_safety_status(self) -> Dict[str, Any]:
         """Get current safety status summary."""

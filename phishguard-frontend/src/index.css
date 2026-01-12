@@ -1,0 +1,124 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================
+   PhishGuard - Cybersecurity Dark Theme
+   ============================================ */
+
+/* Base layer overrides */
+@layer base {
+  html {
+    @apply bg-cyber-bg text-slate-100;
+  }
+  
+  body {
+    @apply min-h-screen;
+  }
+  
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    @apply w-2;
+  }
+  
+  ::-webkit-scrollbar-track {
+    @apply bg-cyber-bg;
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-700 rounded-full hover:bg-slate-600;
+  }
+}
+
+/* Component layer - reusable classes */
+@layer components {
+  /* Cards */
+  .card {
+    @apply bg-cyber-card border border-cyber-border rounded-xl p-6;
+  }
+  
+  .card-hover {
+    @apply card transition-all duration-200 hover:border-slate-600 hover:shadow-lg;
+  }
+  
+  /* Buttons */
+  .btn-primary {
+    @apply px-6 py-3 bg-accent-indigo hover:bg-indigo-600 text-white font-semibold rounded-lg transition-all duration-200 flex items-center gap-2;
+  }
+  
+  .btn-secondary {
+    @apply px-4 py-2 bg-transparent border border-slate-600 hover:bg-slate-800 text-slate-300 rounded-lg transition-all duration-200;
+  }
+  
+  .btn-danger {
+    @apply px-4 py-2 bg-malicious hover:bg-malicious-dark text-white font-medium rounded-lg transition-all duration-200;
+  }
+  
+  /* Status badges */
+  .badge {
+    @apply px-3 py-1 text-xs font-semibold rounded-full;
+  }
+  
+  .badge-safe {
+    @apply badge bg-safe/20 text-safe-light border border-safe/30;
+  }
+  
+  .badge-suspicious {
+    @apply badge bg-suspicious/20 text-suspicious-light border border-suspicious/30;
+  }
+  
+  .badge-malicious {
+    @apply badge bg-malicious/20 text-malicious-light border border-malicious/30;
+  }
+  
+  /* Input fields */
+  .input-dark {
+    @apply w-full px-4 py-3 bg-cyber-surface border border-cyber-border rounded-lg text-slate-100 placeholder-slate-500 focus:outline-none focus:border-accent-indigo focus:ring-1 focus:ring-accent-indigo/50 transition-all duration-200;
+  }
+  
+  /* Glow effects */
+  .glow-safe {
+    @apply shadow-glow-green;
+  }
+  
+  .glow-danger {
+    @apply shadow-glow-red;
+  }
+  
+  .glow-accent {
+    @apply shadow-glow-cyan;
+  }
+}
+
+/* Utility layer */
+@layer utilities {
+  .text-gradient {
+    @apply bg-gradient-to-r from-accent-cyan via-accent-indigo to-accent-purple bg-clip-text text-transparent;
+  }
+  
+  .animate-pulse-glow {
+    animation: pulse-glow 2s ease-in-out infinite;
+  }
+  
+  @keyframes pulse-glow {
+    0%, 100% {
+      box-shadow: 0 0 5px rgba(6, 182, 212, 0.3);
+    }
+    50% {
+      box-shadow: 0 0 20px rgba(6, 182, 212, 0.6);
+    }
+  }
+}
+
+/* Leaflet map dark theme override */
+.leaflet-container {
+  @apply bg-cyber-bg;
+}
+
+.leaflet-tile-pane {
+  filter: brightness(0.6) saturate(0.8) contrast(1.1);
+}
+
+.leaflet-control-zoom a {
+  @apply bg-cyber-card text-slate-100 border-cyber-border hover:bg-slate-700;
+}

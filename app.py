@@ -25,6 +25,24 @@ from typing import Dict, Any, Tuple
 from flask import Flask, request, render_template, jsonify, g
 from flask_cors import CORS
 
+# ============================================================================
+# STARTUP: Directory Initialization
+# ============================================================================
+
+def _ensure_directories():
+    """Ensure required directories exist at startup."""
+    dirs = [
+        os.path.join(os.path.dirname(__file__), "audit"),
+        os.path.join(os.path.dirname(__file__), "src", "governance", "governance_state"),
+    ]
+    for d in dirs:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except PermissionError as e:
+            logging.warning(f"[STARTUP] Cannot create directory {d}: {e}")
+
+_ensure_directories()
+
 # Import decision pipeline (enforces calibration at startup)
 from decision_pipeline import DecisionPipeline, Verdict, analyze_url
 
@@ -89,14 +107,38 @@ if OBSERVABILITY_AVAILABLE:
 # Get metrics collector
 metrics = get_metrics() if OBSERVABILITY_AVAILABLE else None
 
-# Initialize decision pipeline at startup
-# This will CRASH if no calibrated model exists (by design)
+# ============================================================================
+# MODEL INITIALIZATION (with mock model support)
+# ============================================================================
+
+USE_MOCK_MODEL = os.getenv("USE_MOCK_MODEL", "false").lower() == "true"
+pipeline = None
+
 try:
+    if USE_MOCK_MODEL:
+        logger.warning("[APP] USE_MOCK_MODEL=true - Using mock model for testing")
+        mock_path = os.path.join(os.path.dirname(__file__), "models", "mock_model.pkl")
+        
+        # Auto-generate if missing
+        if not os.path.exists(mock_path):
+            logger.info("[APP] Mock model not found - auto-generating...")
+            from scripts.create_mock_model import create_mock_model
+            create_mock_model()
+        
+        # Override model path in trainer
+        import src.training.model_trainer as trainer
+        trainer.MODEL_PATH = mock_path
+    
     pipeline = DecisionPipeline()
     logger.info("[APP] Decision pipeline initialized successfully")
+    
+except FileNotFoundError as e:
+    logger.critical(f"[APP] Model not found: {e}")
+    # Pipeline stays None - readiness check will return 503
+    
 except ValueError as e:
-    logger.critical(f"[APP] FATAL: {e}")
-    raise SystemExit(f"Cannot start: {e}")
+    logger.critical(f"[APP] Pipeline init failed: {e}")
+    # Pipeline stays None - readiness check will return 503
 
 
 def validate_url_input(url: str) -> Tuple[bool, str]:
@@ -245,15 +287,74 @@ def scan_url():
         }), 500
 
 
+@app.route("/health/live", methods=["GET"])
+def liveness_check():
+    """
+    Liveness probe - Is Flask running?
+    Always returns 200 if the app is responding.
+    """
+    return jsonify({"status": "alive"}), 200
+
+
+@app.route("/health/ready", methods=["GET"])
 @app.route("/health", methods=["GET"])
-def health_check():
-    """Health check endpoint."""
+def readiness_check():
+    """
+    Readiness probe - Is the app ready to serve traffic?
+    
+    Returns:
+        200 + "ready": Pipeline loaded, governance accessible
+        200 + "degraded": Pipeline loaded, governance inaccessible
+                          (keeps instance reachable for admin actions)
+        200 + "frozen": Pipeline loaded, system frozen
+        503 + "not_ready": Pipeline not loaded (critical failure)
+    """
+    pipeline_ok = pipeline is not None
+    gov_ok = False
+    frozen = False
+    
+    if GOVERNANCE_AVAILABLE:
+        try:
+            gov_controller = get_governance_controller()
+            gov_ok = True
+            frozen = gov_controller.get_freeze_state().is_frozen
+        except Exception as e:
+            logger.warning(f"[HEALTH] Governance check failed: {e}")
+    
+    # Critical: Pipeline MUST be loaded
+    if not pipeline_ok:
+        return jsonify({
+            "status": "not_ready",
+            "pipeline_ready": False,
+            "governance_accessible": gov_ok,
+            "reason": "ML pipeline failed to initialize"
+        }), 503
+    
+    # Degraded: Pipeline OK but governance inaccessible
+    if not gov_ok:
+        return jsonify({
+            "status": "degraded",
+            "pipeline_ready": True,
+            "governance_accessible": False,
+            "reason": "Governance state inaccessible - admin actions still available"
+        }), 200
+    
+    # Frozen: Still operational but restricted
+    if frozen:
+        return jsonify({
+            "status": "frozen",
+            "pipeline_ready": True,
+            "governance_accessible": True,
+            "frozen": True,
+            "reason": "System frozen - only admin endpoints available"
+        }), 200
+    
     return jsonify({
-        "status": "healthy",
-        "pipeline_ready": pipeline is not None,
-        "model_type": "CalibratedClassifierCV",
-        "governance_available": GOVERNANCE_AVAILABLE
-    })
+        "status": "ready",
+        "pipeline_ready": True,
+        "governance_accessible": True,
+        "frozen": False
+    }), 200
 
 
 @app.route("/api/governance/status", methods=["GET"])

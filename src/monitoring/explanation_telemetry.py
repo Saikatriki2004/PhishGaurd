@@ -18,10 +18,15 @@ DATA COLLECTED (aggregate only):
     - Analysis completion rates
     - Allowlist override frequency
     - Signal type frequency (capped at top 10)
+
+ASYNC AUDIT LOGGING (XAI):
+    Uses QueueHandler/QueueListener for true non-blocking I/O.
+    Records top 3 features per request to JSONL audit file.
 """
 
 import json
 import os
+import queue
 import logging
 import threading
 import atexit
@@ -29,8 +34,103 @@ from datetime import datetime, timezone
 from collections import Counter
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field, asdict
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# ASYNC AUDIT LOGGER (QueueHandler Pattern)
+# ============================================================================
+
+AUDIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "audit")
+os.makedirs(AUDIT_DIR, exist_ok=True)
+
+_audit_queue: queue.Queue = queue.Queue(-1)  # Unbounded queue
+_audit_listener: Optional[QueueListener] = None
+_audit_logger: Optional[logging.Logger] = None
+
+
+def _init_audit_logger() -> logging.Logger:
+    """
+    Initialize async audit logger with QueueHandler.
+    
+    Architecture:
+        Request Thread → QueueHandler → Queue → QueueListener → RotatingFileHandler
+                        (non-blocking)         (background thread)
+    """
+    global _audit_listener, _audit_logger
+    
+    if _audit_logger is not None:
+        return _audit_logger
+    
+    _audit_logger = logging.getLogger("xai_audit")
+    _audit_logger.setLevel(logging.INFO)
+    _audit_logger.propagate = False  # Don't bubble to root logger
+    
+    # Frontend: QueueHandler (non-blocking, just puts to queue)
+    queue_handler = QueueHandler(_audit_queue)
+    _audit_logger.addHandler(queue_handler)
+    
+    # Backend: Actual file handler (runs in background thread via QueueListener)
+    if os.getenv("TELEMETRY_TO_STDOUT", "false").lower() == "true":
+        backend_handler = logging.StreamHandler()
+    else:
+        backend_handler = RotatingFileHandler(
+            os.path.join(AUDIT_DIR, "xai_telemetry.jsonl"),
+            maxBytes=10 * 1024 * 1024,  # 10MB per file
+            backupCount=5,
+            encoding="utf-8"
+        )
+    backend_handler.setFormatter(logging.Formatter("%(message)s"))
+    
+    # QueueListener: Processes queue in dedicated background thread
+    _audit_listener = QueueListener(
+        _audit_queue, 
+        backend_handler, 
+        respect_handler_level=True
+    )
+    _audit_listener.start()
+    
+    # Graceful shutdown
+    atexit.register(_shutdown_audit_logger)
+    
+    logger.info("[TELEMETRY] Async audit logger initialized")
+    return _audit_logger
+
+
+def _shutdown_audit_logger():
+    """Stop queue listener gracefully on process exit."""
+    global _audit_listener
+    if _audit_listener:
+        _audit_listener.stop()
+        _audit_listener = None
+        logger.info("[TELEMETRY] Audit logger shutdown complete")
+
+
+def _record_audit_log(
+    verdict: str,
+    drift_status: str,
+    top_features: List[Dict[str, str]]
+) -> None:
+    """
+    Record XAI audit entry (non-blocking, fire-and-forget).
+    
+    Args:
+        verdict: SAFE, SUSPICIOUS, or PHISHING
+        drift_status: none, warning, or significant
+        top_features: List of {"feature": str, "impact": str}
+    """
+    try:
+        record = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "verdict": verdict,
+            "drift": drift_status,
+            "top_3": top_features
+        }
+        _init_audit_logger().info(json.dumps(record, separators=(",", ":")))
+    except Exception:
+        pass  # Never block request path
 
 # ============================================================================
 # CONFIGURATION
@@ -384,13 +484,29 @@ def record_explanation_telemetry(
     
     SAFETY: This function is fail-safe and will not raise exceptions.
     
+    Records:
+        1. Aggregate metrics (sync, batched flush)
+        2. XAI audit log (async via QueueHandler - non-blocking)
+    
     Args:
         explanation: The explanation dict from decision_pipeline
         verdict: "SAFE", "SUSPICIOUS", or "PHISHING"  
         drift_status: "none", "warning", or "significant"
     """
     try:
+        # Record aggregate metrics (existing behavior)
         get_telemetry().record(explanation, verdict, drift_status)
+        
+        # Record async XAI audit log (non-blocking)
+        top_features = [
+            {"feature": f, "impact": "High"}
+            for f in explanation.get("risk", [])[:3]
+        ] or [
+            {"feature": f, "impact": "Positive"}
+            for f in explanation.get("positive", [])[:3]
+        ]
+        _record_audit_log(verdict, drift_status, top_features)
+        
     except Exception as e:
         # NEVER crash on telemetry
         logger.warning(f"[TELEMETRY] Record failed (non-blocking): {e}")

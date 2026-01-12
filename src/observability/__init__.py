@@ -12,6 +12,7 @@ Usage:
 
 import logging
 import sys
+import os
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -260,44 +261,66 @@ def get_metrics() -> PhishingMetrics:
 
 def setup_rate_limiter(app):
     """
-    Configure rate limiting for the Flask app.
+    Configure rate limiter with Redis support and fail-open behavior.
     
-    Limits:
-    - Single scan: 30/minute per IP
-    - Batch scan: 5/minute per IP
-    - Health check: 60/minute per IP
+    Environment Variables:
+        RATELIMIT_STORAGE_URI: Redis URI (e.g., "redis://localhost:6379")
+                               Falls back to "memory://" for single-process
+    
+    Behavior:
+        - Default limit: 100 per hour
+        - On Redis failure: Logs warning and ALLOWS request (fail-open)
+        - Memory storage: Warning logged (doesn't work across workers)
     
     Args:
         app: Flask application instance
         
     Returns:
-        Limiter instance
+        Limiter instance or None if unavailable
     """
     try:
         from flask_limiter import Limiter
         from flask_limiter.util import get_remote_address
         
+        storage_uri = os.getenv("RATELIMIT_STORAGE_URI", "memory://")
+        
+        # Redis connection options for resilience
+        storage_options = {}
+        if storage_uri.startswith("redis://"):
+            storage_options = {
+                "socket_connect_timeout": 1,
+                "socket_timeout": 1,
+            }
+            logging.info(f"[RATE_LIMIT] Using Redis storage: {storage_uri.split('@')[-1]}")
+        else:
+            logging.warning(
+                "[RATE_LIMIT] Using memory:// - limits NOT shared across workers. "
+                "Set RATELIMIT_STORAGE_URI=redis://... for production."
+            )
+        
         limiter = Limiter(
             app=app,
             key_func=get_remote_address,
-            default_limits=["200 per day", "50 per hour"],
-            storage_uri="memory://",
-            strategy="fixed-window"
+            default_limits=["100 per hour"],
+            storage_uri=storage_uri,
+            storage_options=storage_options,
+            strategy="fixed-window",
+            swallow_errors=True,  # FAIL-OPEN: Redis down → allow request + log
         )
         
         return limiter
         
     except ImportError:
-        logging.warning("[OBSERVABILITY] flask-limiter not installed, rate limiting disabled")
+        logging.warning("[RATE_LIMIT] flask-limiter not installed, rate limiting disabled")
         return None
 
 
-# Rate limit decorators (to be applied in app.py)
+# Rate limit constants for endpoint decorators
 RATE_LIMITS = {
     "scan": "30 per minute",
     "batch_scan": "5 per minute",
-    "health": "60 per minute",
-    "api": "100 per minute"
+    "health": "exempt",
+    "api": "100 per hour"
 }
 
 
